@@ -11,6 +11,7 @@ import org.neo4j.driver.Record;
 import org.neo4j.driver.Session;
 import org.neo4j.driver.Statement;
 import org.neo4j.driver.StatementResult;
+import org.neo4j.driver.Transaction;
 import org.neo4j.driver.Value;
 import org.neo4j.driver.exceptions.ClientException;
 import org.neo4j.driver.exceptions.SessionExpiredException;
@@ -34,7 +35,6 @@ import static org.hamcrest.CoreMatchers.is;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -139,11 +139,11 @@ public class BoltStateHandlerTest {
         boltStateHandler.connect();
         boltStateHandler.beginTransaction();
 
-        assertNotNull(boltStateHandler.getTransactionStatements());
+        assertTrue(boltStateHandler.isTransactionOpen());
 
         boltStateHandler.rollbackTransaction();
 
-        assertNull(boltStateHandler.getTransactionStatements());
+        assertFalse(boltStateHandler.isTransactionOpen());
     }
 
     @Test
@@ -173,11 +173,11 @@ public class BoltStateHandlerTest {
     public void closeTransactionAfterCommit() throws CommandException {
         boltStateHandler.connect();
         boltStateHandler.beginTransaction();
-        assertNotNull(boltStateHandler.getTransactionStatements());
+        assertTrue(boltStateHandler.isTransactionOpen());
 
         boltStateHandler.commitTransaction();
 
-        assertNull(boltStateHandler.getTransactionStatements());
+        assertFalse(boltStateHandler.isTransactionOpen());
     }
 
     @Test
@@ -205,57 +205,35 @@ public class BoltStateHandlerTest {
         boltStateHandler.connect();
 
         boltStateHandler.beginTransaction();
-        assertNotNull(boltStateHandler.getTransactionStatements());
+        assertTrue(boltStateHandler.isTransactionOpen());
     }
 
     @Test
-    public void commitPurgesTheTransactionStatementsAndCollectsResults() throws CommandException {
+    public void whenInTransactionHandlerLetsTransactionDoTheWork() throws CommandException {
+        Transaction transactionMock = mock(Transaction.class);
         Session sessionMock = mock(Session.class);
+        when(sessionMock.beginTransaction()).thenReturn(transactionMock);
         Driver driverMock = stubResultSummaryInAnOpenSession(mock(StatementResult.class), sessionMock, "neo4j-version");
 
-        Record record1 = mock(Record.class);
-        Record record2 = mock(Record.class);
-        Record record3 = mock(Record.class);
-        Value val1 = mock(Value.class);
-        Value val2 = mock(Value.class);
-        Value str1Val = mock(Value.class);
-        Value str2Val = mock(Value.class);
+        StatementResult result = mock(StatementResult.class);
+        ResultSummary resultSummary = mock(ResultSummary.class);
+        DatabaseInfo databaseInfo = mock(DatabaseInfo.class);
+        when(result.summary()).thenReturn(resultSummary);
+        when(resultSummary.database()).thenReturn(databaseInfo);
+        when(databaseInfo.name()).thenReturn(null);
 
-        BoltResult boltResult1 = new ListBoltResult(asList(record1, record2), mock(ResultSummary.class));
-        BoltResult boltResult2 = new ListBoltResult(asList(record3), mock(ResultSummary.class));
-
-        when(str1Val.toString()).thenReturn("str1");
-        when(str2Val.toString()).thenReturn("str2");
-        when(val1.toString()).thenReturn("1");
-        when(val2.toString()).thenReturn("2");
-
-        when(record1.get(0)).thenReturn(val1);
-        when(record2.get(0)).thenReturn(val2);
-
-        when(record3.get(0)).thenReturn(str1Val);
-        when(record3.get(1)).thenReturn(str2Val);
-        when(sessionMock.writeTransaction(anyObject())).thenReturn(asList(boltResult1, boltResult2));
+        when(transactionMock.run((Statement) anyObject())).thenReturn(result);
 
         OfflineBoltStateHandler boltStateHandler = new OfflineBoltStateHandler(driverMock);
         boltStateHandler.connect();
         boltStateHandler.beginTransaction();
-        boltStateHandler.runCypher("UNWIND [1,2] as num RETURN *", Collections.emptyMap());
-        boltStateHandler.runCypher("RETURN \"str1\", \"str2\"", Collections.emptyMap());
+        BoltResult boltResult = boltStateHandler.runCypher("UNWIND [1,2] as num RETURN *", Collections.emptyMap()).get();
+        assertEquals(result, boltResult.iterate());
 
-        Optional<List<BoltResult>> boltResultOptional = boltStateHandler.commitTransaction();
-        List<BoltResult> boltResults = boltResultOptional.get();
-        Record actualRecord1 = boltResults.get(0).getRecords().get(0);
-        Record actualRecord2 = boltResults.get(0).getRecords().get(1);
+        boltStateHandler.commitTransaction();
 
-        Record actualRecord3 = boltResults.get(1).getRecords().get(0);
+        assertFalse(boltStateHandler.isTransactionOpen());
 
-        assertNull(boltStateHandler.getTransactionStatements());
-
-        assertEquals("1", actualRecord1.get(0).toString());
-        assertEquals("2", actualRecord2.get(0).toString());
-
-        assertEquals("str1", actualRecord3.get(0).toString());
-        assertEquals("str2", actualRecord3.get(1).toString());
     }
 
     @Test
@@ -281,7 +259,7 @@ public class BoltStateHandlerTest {
         boltStateHandler.connect();
         boltStateHandler.beginTransaction();
 
-        assertNotNull("Expected a transaction", boltStateHandler.getTransactionStatements());
+        assertTrue("Expected a transaction", boltStateHandler.isTransactionOpen());
     }
 
     @Test
@@ -343,7 +321,7 @@ public class BoltStateHandlerTest {
     public void shouldExecuteInSessionByDefault() throws CommandException {
         boltStateHandler.connect();
 
-        assertNull("Did not expect a transaction", boltStateHandler.getTransactionStatements());
+        assertFalse("Did not expect a transaction", boltStateHandler.isTransactionOpen());
     }
 
     @Test
@@ -376,7 +354,6 @@ public class BoltStateHandlerTest {
 
         // then
         verify(sessionMock).reset();
-        assertNull(boltStateHandler.getTransactionStatements());
     }
 
     @Test

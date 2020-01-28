@@ -1,6 +1,5 @@
 package org.neo4j.shell.state;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -39,10 +38,10 @@ public class BoltStateHandler implements TransactionHandler, Connector, Database
     protected Driver driver;
     Session session;
     private String version;
-    private List<Statement> transactionStatements;
     private String activeDatabaseNameAsSetByUser;
     private String actualDatabaseNameAsReportedByServer;
     private final boolean isInteractive;
+    private Transaction tx = null;
 
     public BoltStateHandler(boolean isInteractive) {
         this(GraphDatabase::driver, isInteractive);
@@ -109,7 +108,7 @@ public class BoltStateHandler implements TransactionHandler, Connector, Database
         if (isTransactionOpen()) {
             throw new CommandException("There is already an open transaction");
         }
-        transactionStatements = new ArrayList<>();
+        tx = session.beginTransaction();
     }
 
     @Override
@@ -120,8 +119,11 @@ public class BoltStateHandler implements TransactionHandler, Connector, Database
         if (!isTransactionOpen()) {
             throw new CommandException("There is no open transaction to commit");
         }
-        return captureResults(transactionStatements);
+        tx.success();
+        tx.close();
+        tx = null;
 
+        return Optional.empty();
     }
 
     @Override
@@ -132,12 +134,14 @@ public class BoltStateHandler implements TransactionHandler, Connector, Database
         if (!isTransactionOpen()) {
             throw new CommandException("There is no open transaction to rollback");
         }
-        clearTransactionStatements();
+        tx.failure();
+        tx.close();
+        tx = null;
     }
 
     @Override
     public boolean isTransactionOpen() {
-        return transactionStatements != null;
+        return tx != null;
     }
 
     @Override
@@ -223,9 +227,9 @@ public class BoltStateHandler implements TransactionHandler, Connector, Database
         if (!isConnected()) {
             throw new CommandException("Not connected to Neo4j");
         }
-        if (this.transactionStatements != null) {
-            transactionStatements.add(new Statement(cypher, queryParams));
-            return Optional.empty();
+        if (isTransactionOpen()) {
+            // If this fails, don't try any funny business - just let it die
+            return getBoltResult(cypher, queryParams);
         } else {
             try {
                 // Note that PERIODIC COMMIT can't execute in a transaction, so if the user has not typed BEGIN, then
@@ -245,7 +249,13 @@ public class BoltStateHandler implements TransactionHandler, Connector, Database
      */
     @Nonnull
     private Optional<BoltResult> getBoltResult(@Nonnull String cypher, @Nonnull Map<String, Object> queryParams) throws SessionExpiredException {
-        StatementResult statementResult = session.run(new Statement(cypher, queryParams));
+        StatementResult statementResult;
+
+        if (isTransactionOpen()){
+            statementResult = tx.run(new Statement(cypher, queryParams));
+        } else {
+            statementResult = session.run(new Statement(cypher, queryParams));
+        }
 
         if (statementResult == null) {
             return Optional.empty();
@@ -298,17 +308,19 @@ public class BoltStateHandler implements TransactionHandler, Connector, Database
             // Clear current state
             if (isTransactionOpen()) {
                 // Bolt has already rolled back the transaction but it doesn't close it properly
-                clearTransactionStatements();
+                tx.failure();
+                tx.close();
+                tx = null;
             }
         }
     }
 
-    List<Statement> getTransactionStatements() {
-        return this.transactionStatements;
-    }
-
-    private void clearTransactionStatements() {
-        this.transactionStatements = null;
+    /**
+     * Used for testing purposes
+     */
+    public void disconnect() {
+         reset();
+         silentDisconnect();
     }
 
     private Driver getDriver(@Nonnull ConnectionConfig connectionConfig, @Nullable AuthToken authToken) {
@@ -319,22 +331,6 @@ public class BoltStateHandler implements TransactionHandler, Connector, Database
             configBuilder = configBuilder.withoutEncryption();
         }
         return driverProvider.apply(connectionConfig.driverUrl(), authToken, configBuilder.toConfig());
-    }
-
-    private Optional<List<BoltResult>> captureResults(@Nonnull List<Statement> transactionStatements) {
-        List<BoltResult> results = executeWithRetry(transactionStatements, (statement, transaction) -> {
-            // calling list() is what actually executes cypher on the server
-            StatementResult sr = transaction.run(statement);
-            BoltResult singleResult = new ListBoltResult(sr.list(), sr.consume(), sr.keys());
-            updateActualDbName(sr);
-            return singleResult;
-        });
-
-        clearTransactionStatements();
-        if (results == null || results.isEmpty()) {
-            return Optional.empty();
-        }
-        return Optional.of(results);
     }
 
     private List<BoltResult> executeWithRetry(List<Statement> transactionStatements, BiFunction<Statement, Transaction, BoltResult> biFunction) {
